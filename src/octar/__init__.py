@@ -6,7 +6,7 @@ import itertools
 import logging
 import typing as t
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from uuid import uuid4
 
@@ -124,7 +124,7 @@ else:
 
 @dataclass(frozen=True, kw_only=True)
 class ActorState[M]:
-    _actor_id: ActorId | None = None
+    _actor_id: ActorId | None = field(default_factory=lambda: ActorSystem._current_actor_id.get())
     _actor_stash: tuple[M, ...] = tuple()
 
     def __init_subclass__(cls, *args, **kwargs) -> None:
@@ -164,9 +164,7 @@ class _Sender[M: ActorMessage](ActorLike[M]):
             return
         if any(isinstance(msg, Request) for msg in msgs):
             raise ValueError("Cannot send Request messages using tell()")
-        self.__actor_system.send(
-            self.__actor_system.current_actor_id, self.__actor_id, *msgs
-        )
+        self.__actor_system.send(self.__actor_system.current_actor_id, self.__actor_id, *msgs)
 
     def ask(self, msg):
         result = self.__actor_system.send(
@@ -223,9 +221,7 @@ class LiveStash[M: ActorMessage](t.MutableSequence[M]):
             raise RuntimeError("Cannot modify LiveStash while actor is not processing")
         while self._buffer:
             msg = self._buffer.pop(0)
-            self._mailbox.put_nowait(
-                _Envelope(MsgPriority.HIGH, next(self._msg_idx_iter), msg)
-            )
+            self._mailbox.put_nowait(_Envelope(MsgPriority.HIGH, next(self._msg_idx_iter), msg))
 
     def __call__(self, msg: M) -> None:
         self.append(msg)
@@ -254,9 +250,7 @@ class Actor[S: ActorState, M: ActorMessage](_Sender[M]):
                 return False
             return True
 
-        self.__stash = LiveStash[M](
-            check_is_processing, mailbox, state._actor_stash, msg_idx_iter
-        )
+        self.__stash = LiveStash[M](check_is_processing, mailbox, state._actor_stash, msg_idx_iter)
 
         actor_system, registration = register_actor(actor_id, self)
         self.__registration = registration
@@ -337,9 +331,7 @@ class _ExternalReceive[M: ActorMessage](t.Protocol):
 
 
 class Registration:
-    def __init__(
-        self, actor_id: ActorId, unregister: t.Callable[[ActorId], None]
-    ) -> None:
+    def __init__(self, actor_id: ActorId, unregister: t.Callable[[ActorId], None]) -> None:
         self._registered = True
         self._actor_id = actor_id
 
@@ -365,9 +357,7 @@ class Registration:
 
 
 class RegisterActor(t.Protocol):
-    def __call__(
-        self, actor_id: ActorId, impl: Actor
-    ) -> tuple["ActorSystem", Registration]: ...
+    def __call__(self, actor_id: ActorId, impl: Actor) -> tuple["ActorSystem", Registration]: ...
 
 
 class ExternalReceiver[M: ActorMessage](_Sender[M]):
@@ -395,9 +385,7 @@ class ExternalReceiver[M: ActorMessage](_Sender[M]):
 
 class ActorSystem:
     # _current_system: ContextVar["ActorSystem | None"] = ContextVar("current_system", default=None)
-    _current_actor_id: ContextVar[ActorId | None] = ContextVar(
-        "current_actor", default=None
-    )
+    _current_actor_id: ContextVar[ActorId | None] = ContextVar("current_actor", default=None)
     _max_batch_msgs: int = 42
 
     # @_classproperty
@@ -444,9 +432,7 @@ class ActorSystem:
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> R:
-        def register_actor(
-            actor_id: ActorId, impl: Actor
-        ) -> tuple["ActorSystem", Registration]:
+        def register_actor(actor_id: ActorId, impl: Actor) -> tuple["ActorSystem", Registration]:
             # if actor_id in self.__receivers:
             #     raise ValueError(f"Actor with id {actor_id} already exists")
 
@@ -521,9 +507,7 @@ class ActorSystem:
                         self.__pendings_ops -= done
 
                 async def dispatch():
-                    def do_step(
-                        receiver_id: ActorId, receiver: Actor, msgs
-                    ) -> aio.Future:
+                    def do_step(receiver_id: ActorId, receiver: Actor, msgs) -> aio.Future:
                         self._current_actor_id.set(receiver_id)
                         receive_func = getattr(receiver, _actor_receive_func_name)
                         f = receive_func(tg.create_task, *msgs)
