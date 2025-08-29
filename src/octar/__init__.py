@@ -6,7 +6,7 @@ import itertools
 import logging
 import typing as t
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from uuid import uuid4
 
@@ -124,15 +124,18 @@ else:
 
 @dataclass(frozen=True, kw_only=True)
 class ActorState[M]:
-    _actor_id: ActorId | None = None
+    _actor_id: ActorId | None = field(
+        default_factory=lambda: ActorSystem._current_actor_id.get()
+    )
     _actor_stash: tuple[M, ...] = tuple()
 
     def __init_subclass__(cls, *args, **kwargs) -> None:
         super().__init_subclass__(*args, **kwargs)
-
-        # NOTE: A super-hacky workaround to make generic base classes work with pydantic deserialization.
-        # TODO: Get rid of this once this issue is resolved:
-        #       https://github.com/copilot/c/cef433fd-22b4-43e4-8bc8-ede6b0c6c646
+        # HACK: A super-hacky workaround to make generic base classes work with pydantic deserialization.
+        #       Seem to be related:
+        #       * https://github.com/pydantic/pydantic/issues/10648
+        #       * https://github.com/pydantic/pydantic/issues/12128
+        #       * https://github.com/pydantic/pydantic/issues/8489
         try:
             resolved = get_filled_type(cls, ActorState, M)
         except TypeError:
@@ -238,9 +241,12 @@ class Actor[S: ActorState, M: ActorMessage](_Sender[M]):
         state: S,
         actor_id: ActorId | None = None,
     ) -> None:
-        actor_id = state._actor_id or actor_id or uuid4().hex
-        if state._actor_id is None:
-            state = dataclasses.replace(state, _actor_id=actor_id)
+        # HACK: As we're setting `_actor_id` of the State by default from the contextvar, a new Actor will get the
+        #       state with `_actor_id` set to the actor that is spawning it. We need to override it here.
+        if ActorSystem._current_actor_id.get() != state._actor_id:
+            actor_id = state._actor_id or actor_id
+        actor_id = actor_id or uuid4().hex
+        state = dataclasses.replace(state, _actor_id=actor_id)
 
         self.__state = state
         self.__processing = None
