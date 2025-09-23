@@ -1,14 +1,16 @@
 import asyncio as aio
 import contextvars
 import dataclasses
+import functools
 import inspect
 import itertools
 import logging
 import typing as t
+from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import IntEnum
-from uuid import uuid4
+from uuid import UUID
 
 from generics import get_filled_type
 from lazy_object_proxy import Proxy  # type: ignore
@@ -39,7 +41,7 @@ class _Envelope[M](t.NamedTuple):
     msg: M
 
 
-type Mailbox[M] = aio.PriorityQueue[_Envelope[M]]
+type _Mailbox[M] = aio.PriorityQueue[_Envelope[M]]
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,7 @@ class Request[Response](t.Awaitable[Response]):
         return self.__response.__await__()
 
 
-type ActorId = str
+ActorId = t.NewType("ActorId", str)
 
 
 class ActorLike[M](t.Protocol):
@@ -73,10 +75,35 @@ class ActorLike[M](t.Protocol):
     def ask(self, msg: M) -> t.Awaitable[t.Any]: ...
 
 
+@dataclass(frozen=True, kw_only=True)
+class ActorState[M]:
+    _actor_id: ActorId | None = field(default_factory=lambda: ActorSystem._current_actor_id.get())
+    _actor_stash: tuple[M, ...] = ()
+
+    @property
+    def actor_id(self) -> ActorId | None:
+        return self._actor_id
+
+    def __init_subclass__(cls, *args, **kwargs) -> None:
+        super().__init_subclass__(*args, **kwargs)
+        # HACK: A super-hacky workaround to make generic base classes work with pydantic deserialization.
+        #       Seems to be related:
+        #       * https://github.com/pydantic/pydantic/issues/10648
+        #       * https://github.com/pydantic/pydantic/issues/12128
+        #       * https://github.com/pydantic/pydantic/issues/8489
+        try:
+            resolved = get_filled_type(cls, ActorState, M)
+        except TypeError:
+            return
+        cls.__dataclass_fields__["_actor_stash"].type = tuple[resolved, ...]
+
+
 class _ActorRefDecl[M](ActorLike[M]):
     def __init__(self, actor_id: ActorId, actor_system: "ActorSystem") -> None: ...
     def tell(self, *msgs) -> t.Any: ...
     def ask(self, msg) -> t.Any: ...
+    @property
+    def actor_id(self) -> ActorId: ...
 
 
 class _ActorRefImpl(Proxy):
@@ -123,27 +150,6 @@ else:
 
 
 @dataclass(frozen=True, kw_only=True)
-class ActorState[M]:
-    _actor_id: ActorId | None = field(
-        default_factory=lambda: ActorSystem._current_actor_id.get()
-    )
-    _actor_stash: tuple[M, ...] = tuple()
-
-    def __init_subclass__(cls, *args, **kwargs) -> None:
-        super().__init_subclass__(*args, **kwargs)
-        # HACK: A super-hacky workaround to make generic base classes work with pydantic deserialization.
-        #       Seem to be related:
-        #       * https://github.com/pydantic/pydantic/issues/10648
-        #       * https://github.com/pydantic/pydantic/issues/12128
-        #       * https://github.com/pydantic/pydantic/issues/8489
-        try:
-            resolved = get_filled_type(cls, ActorState, M)
-        except TypeError:
-            return
-        cls.__dataclass_fields__["_actor_stash"].type = tuple[resolved, ...]
-
-
-@dataclass(frozen=True, kw_only=True)
 class ActorMessage:
     # _actor_sender: ActorRef | None = None
     _actor_sender: None = None
@@ -156,6 +162,7 @@ class _Sender[M: ActorMessage](ActorLike[M]):
 
     @property
     def actor_id(self) -> ActorId:
+        assert self.__actor_id
         return self.__actor_id
 
     @property
@@ -167,9 +174,7 @@ class _Sender[M: ActorMessage](ActorLike[M]):
             return
         if any(isinstance(msg, Request) for msg in msgs):
             raise ValueError("Cannot send Request messages using tell()")
-        self.__actor_system.send(
-            self.__actor_system.current_actor_id, self.__actor_id, *msgs
-        )
+        self.__actor_system.send(self.__actor_system.current_actor_id, self.__actor_id, *msgs)
 
     def ask(self, msg):
         result = self.__actor_system.send(
@@ -185,7 +190,7 @@ class LiveStash[M: ActorMessage](t.MutableSequence[M]):
     def __init__(
         self,
         check_is_processing: t.Callable[[], bool],
-        mailbox: Mailbox[M],
+        mailbox: _Mailbox[M],
         buffer: t.Sequence[M],
         msg_idx_iter: t.Iterator[int],
     ) -> None:
@@ -226,9 +231,7 @@ class LiveStash[M: ActorMessage](t.MutableSequence[M]):
             raise RuntimeError("Cannot modify LiveStash while actor is not processing")
         while self._buffer:
             msg = self._buffer.pop(0)
-            self._mailbox.put_nowait(
-                _Envelope(MsgPriority.HIGH, next(self._msg_idx_iter), msg)
-            )
+            self._mailbox.put_nowait(_Envelope(MsgPriority.HIGH, next(self._msg_idx_iter), msg))
 
     def __call__(self, msg: M) -> None:
         self.append(msg)
@@ -237,15 +240,17 @@ class LiveStash[M: ActorMessage](t.MutableSequence[M]):
 class Actor[S: ActorState, M: ActorMessage](_Sender[M]):
     def __init__(
         self,
-        register_actor: "RegisterActor",
+        registrator: "Registrator",
         state: S,
         actor_id: ActorId | None = None,
     ) -> None:
+        environment = registrator.environment
+        actor_system = registrator.actor_system
         # HACK: As we're setting `_actor_id` of the State by default from the contextvar, a new Actor will get the
         #       state with `_actor_id` set to the actor that is spawning it. We need to override it here.
         if ActorSystem._current_actor_id.get() != state._actor_id:
-            actor_id = state._actor_id or actor_id
-        actor_id = actor_id or uuid4().hex
+            actor_id = state._actor_id if state._actor_id is not None else actor_id
+        actor_id = actor_id if actor_id is not None else environment.create_actor_id()
         state = dataclasses.replace(state, _actor_id=actor_id)
 
         self.__state = state
@@ -260,12 +265,9 @@ class Actor[S: ActorState, M: ActorMessage](_Sender[M]):
                 return False
             return True
 
-        self.__stash = LiveStash[M](
-            check_is_processing, mailbox, state._actor_stash, msg_idx_iter
-        )
+        self.__stash = LiveStash[M](check_is_processing, mailbox, state._actor_stash, msg_idx_iter)
 
-        actor_system, registration = register_actor(actor_id, self)
-        self.__registration = registration
+        self.__registration = registrator(actor_id, self)
         super().__init__(actor_id, actor_system)
 
     if t.TYPE_CHECKING:
@@ -299,6 +301,9 @@ class Actor[S: ActorState, M: ActorMessage](_Sender[M]):
                     #     self.__registration.unregister()
                     msgs.append(msg)
                 state = await self._step(state, *msgs)
+                assert state._actor_id == self.actor_id, (
+                    "State returned from _step must have same _actor_id"
+                )
                 for _ in msgs:
                     self.__mailbox.task_done()
             if any(isinstance(msg, Request) for msg in self.__stash):
@@ -343,9 +348,7 @@ class _ExternalReceive[M: ActorMessage](t.Protocol):
 
 
 class Registration:
-    def __init__(
-        self, actor_id: ActorId, unregister: t.Callable[[ActorId], None]
-    ) -> None:
+    def __init__(self, actor_id: ActorId, unregister: t.Callable[[ActorId], None]) -> None:
         self._registered = True
         self._actor_id = actor_id
 
@@ -370,16 +373,22 @@ class Registration:
         return self._registered
 
 
-class RegisterActor(t.Protocol):
-    def __call__(
-        self, actor_id: ActorId, impl: Actor
-    ) -> tuple["ActorSystem", Registration]: ...
+@dataclass(frozen=True, slots=True)
+class Registrator:
+    """Utility class to nudge users at type-level towards creating actors via ActorSystem.spawn()"""
+
+    environment: "Environment"
+    actor_system: "ActorSystem"
+    _register_impl: t.Callable[[ActorId, Actor], Registration]
+
+    def __call__(self, actor_id: ActorId, impl: Actor) -> Registration:
+        return self._register_impl(actor_id, impl)
 
 
 class ExternalReceiver[M: ActorMessage](_Sender[M]):
     def __init__(
         self,
-        actor_id: str,
+        actor_id: ActorId,
         actor_system: "ActorSystem",
         registration: Registration,
     ) -> None:
@@ -399,20 +408,57 @@ class ExternalReceiver[M: ActorMessage](_Sender[M]):
 #         return self.fget(owner)
 
 
+# MARK: Environment
+class Environment(ABC):
+    @abstractmethod
+    def _uuid4(self) -> UUID:
+        pass
+
+    def create_actor_id(self) -> ActorId:
+        return t.cast(ActorId, self._uuid4().hex)
+
+
+class DefaultEnv(Environment):
+    def _uuid4(self) -> UUID:
+        from uuid import uuid4
+
+        return uuid4()
+
+
+class TemporalWorflowEnv(Environment):
+    def __init__(self, workflow_module) -> None:
+        super().__init__()
+        self._workflow_module = workflow_module
+
+    def _uuid4(self) -> "UUID":
+        return self._workflow_module.uuid4()
+
+
+def _guess_env() -> Environment:
+    try:
+        from temporalio import workflow  # type: ignore
+    except ImportError:
+        pass
+    else:
+        if workflow.in_workflow():
+            return TemporalWorflowEnv(workflow)
+    return DefaultEnv()
+
+
+# MARK: ActorSystem
 class ActorSystem:
     # _current_system: ContextVar["ActorSystem | None"] = ContextVar("current_system", default=None)
-    _current_actor_id: ContextVar[ActorId | None] = ContextVar(
-        "current_actor", default=None
-    )
+    _current_actor_id: ContextVar[ActorId | None] = ContextVar("current_actor", default=None)
     _max_batch_msgs: int = 42
 
     # @_classproperty
     # def current_system(cls) -> "ActorSystem | None":
     #     return cls._current_system.get()
 
-    def __init__(self, logger=_logger) -> None:
+    def __init__(self, environment: Environment | None = None, logger=_logger) -> None:
         self.__scheduled = aio.Queue[_Scheduled]()
         self.__logger = logger
+        self.__environment = environment or _guess_env()
         self.__receivers = dict[ActorId, Actor | _ExternalReceive]()
         self.__pendings_ops = set[aio.Future]()
         self.__running = False
@@ -423,8 +469,15 @@ class ActorSystem:
             raise TypeError(f"Actor with id {actor_id} is not an Actor instance")
         return receiver
 
+    def __iter__(self) -> t.Iterator[Actor]:
+        return (r for r in self.__receivers.values() if isinstance(r, Actor))
+
     def __len__(self) -> int:
         return len(self.__receivers)
+
+    @property
+    def _env(self) -> Environment:
+        return self.__environment
 
     @property
     def current_actor_id(self) -> ActorId | None:
@@ -437,31 +490,32 @@ class ActorSystem:
     def register_external[M: ActorMessage](
         self, receiver: _ExternalReceive[M], actor_id: ActorId | None = None
     ) -> ActorLike[M]:
-        # TODO: Detect, that we're running under Temporal and use workflow.uuid instead as uuid from stdlib is non-deterministic
-        actor_id = actor_id if actor_id is not None else uuid4().hex
+        actor_id = actor_id if actor_id is not None else self.__environment.create_actor_id()
         # if actor_id in self.__receivers:
         #     raise ValueError(f"Actor with id {actor_id} already exists")
         self.__receivers[actor_id] = receiver
         return _Sender(actor_id, self)
 
-    def spawn[**P, R: Actor](
-        self,
-        create_actor: t.Callable[t.Concatenate[RegisterActor, P], R],
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> R:
-        def register_actor(
-            actor_id: ActorId, impl: Actor
-        ) -> tuple["ActorSystem", Registration]:
+    @functools.cached_property
+    def __actor_registrator(self) -> Registrator:
+        def register_actor(actor_id: ActorId, impl: Actor):
             # if actor_id in self.__receivers:
             #     raise ValueError(f"Actor with id {actor_id} already exists")
 
             self.__receivers[actor_id] = impl
 
-            return self, Registration(actor_id, self._unregister)
+            return Registration(actor_id, self._unregister)
 
-        actor = create_actor(register_actor, *args, **kwargs)
-        return t.cast(R, ActorRef(actor.actor_id, self))  # type: ignore
+        return Registrator(self.__environment, self, register_actor)
+
+    def spawn[**P, R: Actor](
+        self,
+        create_actor: t.Callable[t.Concatenate[Registrator, P], R],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        actor = create_actor(self.__actor_registrator, *args, **kwargs)
+        return t.cast(R, _ActorRefImpl(actor.actor_id, self))  # type: ignore
 
     def _unregister(self, actor_id: ActorId) -> None:
         if actor_id not in self.__receivers:
@@ -495,7 +549,6 @@ class ActorSystem:
 
             return result
         else:
-            # TODO: Get rid of multiple messages per send altogether and use stash inside of actors instead.
             assert len(msgs) == 1, "External receiver can only handle single message"
             external_result = receiver(*msgs)
             if inspect.isawaitable(external_result):
@@ -527,9 +580,7 @@ class ActorSystem:
                         self.__pendings_ops -= done
 
                 async def dispatch():
-                    def do_step(
-                        receiver_id: ActorId, receiver: Actor, msgs
-                    ) -> aio.Future:
+                    def do_step(receiver_id: ActorId, receiver: Actor, msgs) -> aio.Future:
                         self._current_actor_id.set(receiver_id)
                         receive_func = getattr(receiver, _actor_receive_func_name)
                         f = receive_func(tg.create_task, *msgs)
@@ -558,7 +609,7 @@ class ActorSystem:
                 # NOTE: Wrap with TaskGroup' tasks to ensure that exceptions are correctly propagated.
                 async with running(tg.create_task(dispatch())):
                     await tg.create_task(wait_exhausted())
-        except BaseException as e:
-            raise e
+        # except BaseException as e:
+        #     raise e
         finally:
             self.__running = False
