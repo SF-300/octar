@@ -6,7 +6,7 @@ build-backend = "uv_build"
 name = "octar"
 version = "0.1.0"
 description = "Discrete and marshallable actor system for python"
-readme = "README.md"
+readme = "../README.md"
 license = "MIT"
 authors = [{ name = "Vladimir Lebedev", email = "zeronineseven@gmail.com" }]
 keywords = [

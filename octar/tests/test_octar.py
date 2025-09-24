@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from octar import Actor, ActorMessage, ActorState, ActorSystem, RegisterActor, Request
+from octar import Actor, ActorState, ActorSystem, Registrator
+from octar.base import Request
 
 
 async def test_actor_state_and_simple_message():
@@ -193,7 +194,7 @@ async def test_nested_actor_request_response():
         nested_call_complete: bool = False
 
     class RequesterActor(Actor):
-        def __init__(self, register_actor: RegisterActor, state: RequesterState, responder: Actor):
+        def __init__(self, register_actor: Registrator, state: RequesterState, responder: Actor):
             super().__init__(register_actor, state)
             self.responder = responder
 
@@ -287,7 +288,7 @@ async def test_chain_of_actors_request_response():
     class MiddleActor(Actor):
         def __init__(
             self,
-            register_actor: RegisterActor,
+            register_actor: Registrator,
             state: MiddleActorState,
             final_actor: Actor,
         ):
@@ -312,7 +313,7 @@ async def test_chain_of_actors_request_response():
     class InitiatorActor(Actor):
         def __init__(
             self,
-            register_actor: RegisterActor,
+            register_actor: Registrator,
             state: InitiatorState,
             middle_actor: Actor,
         ):
@@ -433,7 +434,7 @@ async def test_request_with_broken_response():
         error: Exception | None = None
 
     class RequesterActor(Actor):
-        def __init__(self, register_actor: RegisterActor, state: RequesterState, responder: Actor):
+        def __init__(self, register_actor: Registrator, state: RequesterState, responder: Actor):
             super().__init__(register_actor, state)
             self.responder = responder
 
@@ -509,7 +510,7 @@ async def test_stash_unstash_happy_path_preserves_order_and_empties_stash():
         stashed_count: int = 0
 
     class StashingActor(Actor):
-        def __init__(self, register: RegisterActor, state: S):
+        def __init__(self, register: Registrator, state: S):
             super().__init__(register, state)
 
         async def _step(self, state: S, *events: t.Union[str, int]) -> S:
@@ -570,7 +571,7 @@ async def test_multiple_batches_stashed_then_single_resume_replays_all_in_order(
         stashed_count: int = 0
 
     class StashingActor(Actor):
-        def __init__(self, register: RegisterActor, state: S):
+        def __init__(self, register: Registrator, state: S):
             super().__init__(register, state)
 
         async def _step(self, state: S, *events: t.Union[str, int]) -> S:

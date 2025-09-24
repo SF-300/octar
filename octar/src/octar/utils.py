@@ -9,10 +9,9 @@ async def running(task: t.Awaitable) -> t.AsyncIterator[None]:
     try:
         yield
     finally:
-        if not fut.cancel():
-            return
-        with contextlib.suppress(aio.CancelledError):
-            await fut
+        if fut.cancel():
+            with contextlib.suppress(aio.CancelledError):
+                await fut
 
 
 def create_resolved_f[T](value: T) -> aio.Future[T]:

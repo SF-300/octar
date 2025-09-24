@@ -6,73 +6,25 @@ import inspect
 import itertools
 import logging
 import typing as t
-from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from enum import IntEnum
-from uuid import UUID
 
 from generics import get_filled_type
-from lazy_object_proxy import Proxy  # type: ignore
+from lazy_object_proxy import Proxy
 
-# from pydantic import GetCoreSchemaHandler, ValidationInfo
-# from pydantic_core import core_schema, PydanticCustomError
+from .base import (
+    ActorId,
+    ActorLike,
+    ActorMessage,
+    Envelope,
+    ExternalReceive,
+    MsgPriority,
+    Registration,
+    Request,
+)
+from .environment import Environment, guess_env
+from .stash import LiveStash
 from .utils import create_resolved_f, running
-
-_logger = logging.getLogger(__name__)
-
-
-class MsgPriority(IntEnum):
-    NORMAL = 2
-    HIGH = 1
-    URGENT = 0
-
-
-# TODO: Implement proper actor termination - now they can just be overwritten by new actors with the same ID.
-# class PoisonPill:
-#     pass
-
-
-class _Envelope[M](t.NamedTuple):
-    priority: MsgPriority
-    # NOTE: PriorityQueue does not maintain insertion order itself, so we have to enforce it manually.
-    #       https://stackoverflow.com/a/47969819/3344105
-    msg_idx: int
-    msg: M
-
-
-type _Mailbox[M] = aio.PriorityQueue[_Envelope[M]]
-
-
-@dataclass(frozen=True)
-class Request[Response](t.Awaitable[Response]):
-    __response: aio.Future[Response] = dataclasses.field(
-        default_factory=aio.Future,
-        init=False,
-        repr=False,
-        hash=False,
-        compare=False,
-    )
-
-    def set_result(self, result: Response) -> None:
-        self.__response.set_result(result)
-
-    def set_exception(self, exception: Exception) -> None:
-        self.__response.set_exception(exception)
-
-    def cancel(self) -> None:
-        self.__response.cancel()
-
-    def __await__(self) -> t.Generator[t.Any, None, Response]:
-        return self.__response.__await__()
-
-
-ActorId = t.NewType("ActorId", str)
-
-
-class ActorLike[M](t.Protocol):
-    def tell(self, *msgs: M) -> None: ...
-    def ask(self, msg: M) -> t.Awaitable[t.Any]: ...
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -149,13 +101,7 @@ else:
     ActorRef = _ActorRefImpl
 
 
-@dataclass(frozen=True, kw_only=True)
-class ActorMessage:
-    # _actor_sender: ActorRef | None = None
-    _actor_sender: None = None
-
-
-class _Sender[M: ActorMessage](ActorLike[M]):
+class Sender[M: ActorMessage](ActorLike[M]):
     def __init__(self, actor_id: ActorId, actor_system: "ActorSystem") -> None:
         self.__actor_id = actor_id
         self.__actor_system = actor_system
@@ -186,58 +132,7 @@ class _Sender[M: ActorMessage](ActorLike[M]):
         return result
 
 
-class LiveStash[M: ActorMessage](t.MutableSequence[M]):
-    def __init__(
-        self,
-        check_is_processing: t.Callable[[], bool],
-        mailbox: _Mailbox[M],
-        buffer: t.Sequence[M],
-        msg_idx_iter: t.Iterator[int],
-    ) -> None:
-        self._check_is_processing = check_is_processing
-        self._mailbox = mailbox
-        self._buffer = list(buffer)
-        self._msg_idx_iter = msg_idx_iter
-
-    def __getitem__(self, index):
-        return self._buffer[index]
-
-    def __len__(self):
-        return len(self._buffer)
-
-    def __setitem__(self, index, value):
-        if not self._check_is_processing():
-            raise RuntimeError("Cannot modify LiveStash while actor is not processing")
-        self._buffer[index] = value
-
-    def __delitem__(self, index):
-        if not self._check_is_processing():
-            raise RuntimeError("Cannot modify LiveStash while actor is not processing")
-        del self._buffer[index]
-
-    def insert(self, index, value):
-        if not self._check_is_processing():
-            raise RuntimeError("Cannot modify LiveStash while actor is not processing")
-        self._buffer.insert(index, value)
-
-    def rindex(self, value: M) -> int:
-        self.reverse()
-        i = self.index(value)
-        self.reverse()
-        return len(self) - i - 1
-
-    def unstash_all(self) -> None:
-        if not self._check_is_processing():
-            raise RuntimeError("Cannot modify LiveStash while actor is not processing")
-        while self._buffer:
-            msg = self._buffer.pop(0)
-            self._mailbox.put_nowait(_Envelope(MsgPriority.HIGH, next(self._msg_idx_iter), msg))
-
-    def __call__(self, msg: M) -> None:
-        self.append(msg)
-
-
-class Actor[S: ActorState, M: ActorMessage](_Sender[M]):
+class Actor[S: ActorState, M: ActorMessage](Sender[M]):
     def __init__(
         self,
         registrator: "Registrator",
@@ -322,7 +217,7 @@ class Actor[S: ActorState, M: ActorMessage](_Sender[M]):
             return self.__processing or create_resolved_f(None)
         for msg in msgs:
             self.__mailbox.put_nowait(
-                _Envelope(
+                Envelope(
                     priority=MsgPriority.NORMAL,
                     msg_idx=next(self.__msg_idx_iter),
                     msg=msg,
@@ -337,40 +232,10 @@ _actor_receive_func_name = f"_{Actor.__name__}__receive"
 assert hasattr(Actor, _actor_receive_func_name)
 
 
-class _Scheduled(t.NamedTuple):
+class Scheduled(t.NamedTuple):
     receiver_id: ActorId
     receiver: Actor
     msgs: t.Sequence[t.Any]
-
-
-class _ExternalReceive[M: ActorMessage](t.Protocol):
-    def __call__(self, msg: M, /) -> t.Any: ...
-
-
-class Registration:
-    def __init__(self, actor_id: ActorId, unregister: t.Callable[[ActorId], None]) -> None:
-        self._registered = True
-        self._actor_id = actor_id
-
-        def unregister_wrapper(actor_id: ActorId) -> None:
-            if not self._registered:
-                return
-            unregister(actor_id)
-            self._registered = False
-
-        self._unregister = unregister_wrapper
-
-    def __enter__(self) -> t.Self:
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self._unregister(self._actor_id)
-
-    def unregister(self) -> None:
-        self._unregister(self._actor_id)
-
-    def __bool__(self) -> bool:
-        return self._registered
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +250,7 @@ class Registrator:
         return self._register_impl(actor_id, impl)
 
 
-class ExternalReceiver[M: ActorMessage](_Sender[M]):
+class ExternalReceiver[M: ActorMessage](Sender[M]):
     def __init__(
         self,
         actor_id: ActorId,
@@ -408,43 +273,6 @@ class ExternalReceiver[M: ActorMessage](_Sender[M]):
 #         return self.fget(owner)
 
 
-# MARK: Environment
-class Environment(ABC):
-    @abstractmethod
-    def _uuid4(self) -> UUID:
-        pass
-
-    def create_actor_id(self) -> ActorId:
-        return t.cast(ActorId, self._uuid4().hex)
-
-
-class DefaultEnv(Environment):
-    def _uuid4(self) -> UUID:
-        from uuid import uuid4
-
-        return uuid4()
-
-
-class TemporalWorflowEnv(Environment):
-    def __init__(self, workflow_module) -> None:
-        super().__init__()
-        self._workflow_module = workflow_module
-
-    def _uuid4(self) -> "UUID":
-        return self._workflow_module.uuid4()
-
-
-def _guess_env() -> Environment:
-    try:
-        from temporalio import workflow  # type: ignore
-    except ImportError:
-        pass
-    else:
-        if workflow.in_workflow():
-            return TemporalWorflowEnv(workflow)
-    return DefaultEnv()
-
-
 # MARK: ActorSystem
 class ActorSystem:
     # _current_system: ContextVar["ActorSystem | None"] = ContextVar("current_system", default=None)
@@ -455,11 +283,11 @@ class ActorSystem:
     # def current_system(cls) -> "ActorSystem | None":
     #     return cls._current_system.get()
 
-    def __init__(self, environment: Environment | None = None, logger=_logger) -> None:
-        self.__scheduled = aio.Queue[_Scheduled]()
-        self.__logger = logger
-        self.__environment = environment or _guess_env()
-        self.__receivers = dict[ActorId, Actor | _ExternalReceive]()
+    def __init__(self, environment: Environment | None = None, logger=None) -> None:
+        self.__scheduled = aio.Queue[Scheduled]()
+        self.__logger = logging.getLogger(__name__) if logger is None else logger
+        self.__environment = environment or guess_env()
+        self.__receivers = dict[ActorId, Actor | ExternalReceive]()
         self.__pendings_ops = set[aio.Future]()
         self.__running = False
 
@@ -488,13 +316,13 @@ class ActorSystem:
         return self.__running
 
     def register_external[M: ActorMessage](
-        self, receiver: _ExternalReceive[M], actor_id: ActorId | None = None
+        self, receiver: ExternalReceive[M], actor_id: ActorId | None = None
     ) -> ActorLike[M]:
         actor_id = actor_id if actor_id is not None else self.__environment.create_actor_id()
         # if actor_id in self.__receivers:
         #     raise ValueError(f"Actor with id {actor_id} already exists")
         self.__receivers[actor_id] = receiver
-        return _Sender(actor_id, self)
+        return Sender(actor_id, self)
 
     @functools.cached_property
     def __actor_registrator(self) -> Registrator:
@@ -537,7 +365,7 @@ class ActorSystem:
                 raise ValueError("Cannot send multiple Request messages at once")
 
             self.__scheduled.put_nowait(
-                _Scheduled(
+                Scheduled(
                     receiver_id=receiver_id,
                     receiver=receiver,
                     msgs=msgs,
@@ -599,7 +427,7 @@ class ActorSystem:
                         if not remaining:
                             continue
                         self.__scheduled.put_nowait(
-                            _Scheduled(
+                            Scheduled(
                                 receiver_id=receiver_id,
                                 receiver=receiver,
                                 msgs=remaining,
