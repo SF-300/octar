@@ -5,8 +5,9 @@ from dataclasses import dataclass
 
 import pytest
 
-from octar import Actor, ActorState, ActorSystem, Registrator
+from octar import Actor, ActorState, ActorSystem
 from octar.base import Request
+from octar.core import Registrator
 
 
 async def test_actor_state_and_simple_message():

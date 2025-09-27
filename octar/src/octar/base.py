@@ -63,31 +63,5 @@ class ActorMessage:
     _actor_sender: None = None
 
 
-class ExternalReceive[M: ActorMessage](t.Protocol):
+class ExternalReceiver[M: ActorMessage](t.Protocol):
     def __call__(self, msg: M, /) -> t.Any: ...
-
-
-class Registration:
-    def __init__(self, actor_id: ActorId, unregister: t.Callable[[ActorId], None]) -> None:
-        self._registered = True
-        self._actor_id = actor_id
-
-        def unregister_wrapper(actor_id: ActorId) -> None:
-            if not self._registered:
-                return
-            unregister(actor_id)
-            self._registered = False
-
-        self._unregister = unregister_wrapper
-
-    def __enter__(self) -> t.Self:
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self._unregister(self._actor_id)
-
-    def unregister(self) -> None:
-        self._unregister(self._actor_id)
-
-    def __bool__(self) -> bool:
-        return self._registered

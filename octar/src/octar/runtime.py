@@ -8,6 +8,7 @@ import logging
 import typing as t
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from warnings import deprecated
 
 from generics import get_filled_type
 from lazy_object_proxy import Proxy
@@ -17,11 +18,11 @@ from .base import (
     ActorLike,
     ActorMessage,
     Envelope,
-    ExternalReceive,
+    ExternalReceiver,
     MsgPriority,
-    Registration,
     Request,
 )
+from .core import InternalActorSystem, InternalReceiver, Registrator
 from .environment import Environment, guess_env
 from .stash import LiveStash
 from .utils import create_resolved_f, running
@@ -102,7 +103,7 @@ else:
 
 
 class Sender[M: ActorMessage](ActorLike[M]):
-    def __init__(self, actor_id: ActorId, actor_system: "ActorSystem") -> None:
+    def __init__(self, actor_id: ActorId, actor_system: InternalActorSystem) -> None:
         self.__actor_id = actor_id
         self.__actor_system = actor_system
 
@@ -110,10 +111,6 @@ class Sender[M: ActorMessage](ActorLike[M]):
     def actor_id(self) -> ActorId:
         assert self.__actor_id
         return self.__actor_id
-
-    @property
-    def _actor_system(self) -> "ActorSystem":
-        return self.__actor_system
 
     def tell(self, *msgs: M) -> None:
         if len(msgs) == 0:
@@ -132,6 +129,7 @@ class Sender[M: ActorMessage](ActorLike[M]):
         return result
 
 
+# MARK: Actor
 class Actor[S: ActorState, M: ActorMessage](Sender[M]):
     def __init__(
         self,
@@ -139,13 +137,11 @@ class Actor[S: ActorState, M: ActorMessage](Sender[M]):
         state: S,
         actor_id: ActorId | None = None,
     ) -> None:
-        environment = registrator.environment
-        actor_system = registrator.actor_system
         # HACK: As we're setting `_actor_id` of the State by default from the contextvar, a new Actor will get the
         #       state with `_actor_id` set to the actor that is spawning it. We need to override it here.
-        if ActorSystem._current_actor_id.get() != state._actor_id:
-            actor_id = state._actor_id if state._actor_id is not None else actor_id
-        actor_id = actor_id if actor_id is not None else environment.create_actor_id()
+        if ActorSystem._current_actor_id.get() != state.actor_id:
+            actor_id = state.actor_id if state.actor_id is not None else actor_id
+        actor_id = actor_id if actor_id is not None else registrator.create_actor_id()
         state = dataclasses.replace(state, _actor_id=actor_id)
 
         self.__state = state
@@ -162,8 +158,8 @@ class Actor[S: ActorState, M: ActorMessage](Sender[M]):
 
         self.__stash = LiveStash[M](check_is_processing, mailbox, state._actor_stash, msg_idx_iter)
 
-        self.__registration = registrator(actor_id, self)
-        super().__init__(actor_id, actor_system)
+        self.__actor_system = registrator(actor_id, InternalReceiver(self, self.__receive))
+        super().__init__(actor_id, self.__actor_system)
 
     if t.TYPE_CHECKING:
 
@@ -175,6 +171,11 @@ class Actor[S: ActorState, M: ActorMessage](Sender[M]):
             return super().ask(msg)
 
     @property
+    @deprecated("Use `_spawn` directly instead")
+    def _actor_system(self) -> InternalActorSystem:
+        return self.__actor_system
+
+    @property
     def state(self) -> S:
         return self.__state
 
@@ -182,16 +183,29 @@ class Actor[S: ActorState, M: ActorMessage](Sender[M]):
     def _stash(self) -> LiveStash[M]:
         return self.__stash
 
+    @property
+    def _logger(self) -> logging.Logger:
+        return self.__actor_system.logger
+
+    def _spawn[**P, R: Actor](
+        self,
+        create_actor: t.Callable[t.Concatenate[Registrator, P], R],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        return self.__actor_system.spawn(create_actor, *args, **kwargs)
+
     async def _step(self, state: S, *msgs: M) -> S:
         return state
 
     async def __process(self) -> None:
-        state = self.__state
+        orig_state = state = self.__state
+        mbox = self.__mailbox
         try:
-            while not self.__mailbox.empty():
+            while not mbox.empty():
                 msgs = []
-                while not self.__mailbox.empty():
-                    *_, msg = await self.__mailbox.get()
+                while not mbox.empty():
+                    *_, msg = mbox.get_nowait()
                     # if isinstance(msg, PoisonPill):
                     #     self.__registration.unregister()
                     msgs.append(msg)
@@ -199,22 +213,38 @@ class Actor[S: ActorState, M: ActorMessage](Sender[M]):
                 assert state._actor_id == self.actor_id, (
                     "State returned from _step must have same _actor_id"
                 )
-                for _ in msgs:
-                    self.__mailbox.task_done()
+                for msg in msgs:
+                    try:
+                        self.__actor_system.on_message_processed(self.actor_id, msg)
+                    except Exception as e:
+                        self._logger.exception(
+                            f"Exception in on_message_processed for actor {self.actor_id}: {e}"
+                        )
+                    # mbox.task_done()
             if any(isinstance(msg, Request) for msg in self.__stash):
                 raise ValueError("Requests cannot be persisted in stash")
-            self.__state = dataclasses.replace(state, _actor_stash=tuple(self.__stash))
+            stash = tuple(self.__stash)
+
+            state = dataclasses.replace(state, _actor_stash=stash)
+            if state != orig_state:
+                try:
+                    self.__actor_system.on_actor_state_changed(self.actor_id, orig_state, state)
+                except Exception as e:
+                    self._logger.exception(
+                        f"Exception in on_actor_state_changed for actor {self.actor_id}: {e}"
+                    )
+            self.__state = state
         finally:
             self.__processing = None
 
     def __receive(
         self,
         create_task: t.Callable[[t.Coroutine], aio.Future[t.Any]],
-        *msgs: M,
+        *msgs: ActorMessage,
     ) -> aio.Future[t.Any]:
-        if not self.__registration:
-            # TODO: Dead letter queue?
-            return self.__processing or create_resolved_f(None)
+        # if not self.__registration:
+        #     # TODO: Dead letter queue?
+        #     return self.__processing or create_resolved_f(None)
         for msg in msgs:
             self.__mailbox.put_nowait(
                 Envelope(
@@ -234,31 +264,18 @@ assert hasattr(Actor, _actor_receive_func_name)
 
 class Scheduled(t.NamedTuple):
     receiver_id: ActorId
-    receiver: Actor
+    receiver: InternalReceiver
     msgs: t.Sequence[t.Any]
 
 
-@dataclass(frozen=True, slots=True)
-class Registrator:
-    """Utility class to nudge users at type-level towards creating actors via ActorSystem.spawn()"""
-
-    environment: "Environment"
-    actor_system: "ActorSystem"
-    _register_impl: t.Callable[[ActorId, Actor], Registration]
-
-    def __call__(self, actor_id: ActorId, impl: Actor) -> Registration:
-        return self._register_impl(actor_id, impl)
-
-
-class ExternalReceiver[M: ActorMessage](Sender[M]):
+class ExternalSender[M: ActorMessage](Sender[M]):
     def __init__(
         self,
         actor_id: ActorId,
-        actor_system: "ActorSystem",
-        registration: Registration,
+        actor_system: InternalActorSystem,
     ) -> None:
+        self.__actor_system = actor_system
         super().__init__(actor_id, actor_system)
-        self.__registration = registration
 
     # def unregister(self) -> None:
     #     self.__registration.unregister()
@@ -287,18 +304,18 @@ class ActorSystem:
         self.__scheduled = aio.Queue[Scheduled]()
         self.__logger = logging.getLogger(__name__) if logger is None else logger
         self.__environment = environment or guess_env()
-        self.__receivers = dict[ActorId, Actor | ExternalReceive]()
+        self.__receivers = dict[ActorId, InternalReceiver | ExternalReceiver]()
         self.__pendings_ops = set[aio.Future]()
         self.__running = False
 
     def __getitem__(self, actor_id: ActorId) -> Actor:
         receiver = self.__receivers[actor_id]
-        if not isinstance(receiver, Actor):
-            raise TypeError(f"Actor with id {actor_id} is not an Actor instance")
-        return receiver
+        if not isinstance(receiver, InternalReceiver):
+            raise KeyError(f"Actor with id {actor_id} is not an Actor instance")
+        return receiver.actor
 
     def __iter__(self) -> t.Iterator[Actor]:
-        return (r for r in self.__receivers.values() if isinstance(r, Actor))
+        return (r.actor for r in self.__receivers.values() if isinstance(r, InternalReceiver))
 
     def __len__(self) -> int:
         return len(self.__receivers)
@@ -315,26 +332,54 @@ class ActorSystem:
     def is_running(self) -> bool:
         return self.__running
 
+    def _on_message_enqueued(self, actor_id: ActorId, msg: ActorMessage) -> None:
+        pass
+
+    def _on_message_processed(self, actor_id: ActorId, msg: ActorMessage) -> None:
+        pass
+
+    def _on_actor_state_changed(self, actor_id: ActorId, old: ActorState, new: ActorState) -> None:
+        pass
+
+    def _on_receiver_registered(self, actor_id: ActorId) -> None:
+        pass
+
+    def _on_receiver_unregistered(self, actor_id: ActorId) -> None:
+        pass
+
+    @functools.cached_property
+    def __actor_facing_api(self) -> InternalActorSystem:
+        return InternalActorSystem(
+            logger=self.__logger,
+            send=self.send,
+            spawn=self.spawn,
+            on_message_processed=self._on_message_processed,
+            on_actor_state_changed=self._on_actor_state_changed,
+            _get_current_actor_id=self._current_actor_id.get,
+        )
+
     def register_external[M: ActorMessage](
-        self, receiver: ExternalReceive[M], actor_id: ActorId | None = None
-    ) -> ActorLike[M]:
+        self, receiver: ExternalReceiver[M], actor_id: ActorId | None = None
+    ) -> ExternalSender[M]:
         actor_id = actor_id if actor_id is not None else self.__environment.create_actor_id()
         # if actor_id in self.__receivers:
         #     raise ValueError(f"Actor with id {actor_id} already exists")
         self.__receivers[actor_id] = receiver
-        return Sender(actor_id, self)
+        return ExternalSender(actor_id, self.__actor_facing_api)
 
     @functools.cached_property
     def __actor_registrator(self) -> Registrator:
-        def register_actor(actor_id: ActorId, impl: Actor):
+        def register_actor(actor_id: ActorId, receiver: InternalReceiver):
             # if actor_id in self.__receivers:
             #     raise ValueError(f"Actor with id {actor_id} already exists")
 
-            self.__receivers[actor_id] = impl
+            self.__receivers[actor_id] = receiver
 
-            return Registration(actor_id, self._unregister)
+            self._on_receiver_registered(actor_id)
 
-        return Registrator(self.__environment, self, register_actor)
+            return self.__actor_facing_api
+
+        return Registrator(self.__environment.create_actor_id, register_actor)
 
     def spawn[**P, R: Actor](
         self,
@@ -356,14 +401,22 @@ class ActorSystem:
         receiver_id: ActorId,
         *msgs: t.Any,
     ) -> t.Awaitable[t.Any] | None:
+        if len(msgs) == 0:
+            return None
+        elif len(msgs) > 1 and any(isinstance(msg, Request) for msg in msgs):
+            raise ValueError("Cannot send multiple Request messages at once")
+
         receiver = self.__receivers[receiver_id]
 
-        if isinstance(receiver, Actor):
-            if len(msgs) == 0:
-                return None
-            elif len(msgs) > 1 and any(isinstance(msg, Request) for msg in msgs):
-                raise ValueError("Cannot send multiple Request messages at once")
+        for msg in msgs:
+            try:
+                self._on_message_enqueued(receiver_id, msg)
+            except Exception as e:
+                self.__logger.exception(
+                    f"Exception in on_message_enqueued for actor {receiver_id}: {e}"
+                )
 
+        if isinstance(receiver, InternalReceiver):
             self.__scheduled.put_nowait(
                 Scheduled(
                     receiver_id=receiver_id,
@@ -385,6 +438,18 @@ class ActorSystem:
                 self.__pendings_ops.add(f)
             else:
                 f = create_resolved_f(external_result)
+
+            @f.add_done_callback
+            def _(_) -> None:
+                self.__pendings_ops.discard(f)
+                for msg in msgs:
+                    try:
+                        self._on_message_processed(receiver_id, msg)
+                    except Exception as e:
+                        self.__logger.exception(
+                            f"Exception in on_message_processed for actor {receiver_id}: {e}"
+                        )
+
             return f
 
     async def step(self) -> None:
@@ -408,10 +473,11 @@ class ActorSystem:
                         self.__pendings_ops -= done
 
                 async def dispatch():
-                    def do_step(receiver_id: ActorId, receiver: Actor, msgs) -> aio.Future:
+                    def do_step(
+                        receiver_id: ActorId, receiver: InternalReceiver, msgs
+                    ) -> aio.Future:
                         self._current_actor_id.set(receiver_id)
-                        receive_func = getattr(receiver, _actor_receive_func_name)
-                        f = receive_func(tg.create_task, *msgs)
+                        f = receiver(tg.create_task, *msgs)
                         return f
 
                     while True:

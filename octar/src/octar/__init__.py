@@ -1,4 +1,5 @@
-from .runtime import Actor, ActorState, ActorSystem, Registrator
+from .core import Registrator
+from .runtime import Actor, ActorState, ActorSystem
 
 __all__ = [
     "Actor",
