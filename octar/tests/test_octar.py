@@ -10,6 +10,13 @@ from octar.base import Request
 from octar.core import Registrator
 
 
+# Concrete implementation of ActorSystem for testing
+class TestActorSystem(ActorSystem[None, t.Any]):
+    @property
+    def state(self) -> None:
+        return None
+
+
 async def test_actor_state_and_simple_message():
     """Test actor initialization and simple message handling."""
 
@@ -25,7 +32,7 @@ async def test_actor_state_and_simple_message():
             return dataclasses.replace(state, value=new_value)
 
     # Create an actor system
-    system = ActorSystem()
+    system = TestActorSystem()
 
     # Spawn an actor
     actor = system.spawn(CounterActor, CounterState())
@@ -77,7 +84,7 @@ async def test_multiple_actors():
             return dataclasses.replace(state, total=new_total)
 
     # Create an actor system
-    system = ActorSystem()
+    system = TestActorSystem()
 
     # Spawn actors
     producer = system.spawn(ProducerActor, ProducerState())
@@ -132,7 +139,7 @@ async def test_actor_request_response():
             return dataclasses.replace(state, pending_requests=new_pending)
 
     # Create an actor system
-    system = ActorSystem()
+    system = TestActorSystem()
 
     # Spawn an actor
     actor = system.spawn(EchoActor, EchoState())
@@ -238,7 +245,7 @@ async def test_nested_actor_request_response():
             )
 
     # Create an actor system
-    system = ActorSystem()
+    system = TestActorSystem()
 
     # Spawn actors
     responder = system.spawn(ResponderActor, ResponderState())
@@ -333,7 +340,7 @@ async def test_chain_of_actors_request_response():
             return dataclasses.replace(state, response=new_response)
 
     # Create system
-    system = ActorSystem()
+    system = TestActorSystem()
 
     # Spawn actors in reverse order
     final_actor = system.spawn(FinalResponderActor, FinalResponderState())
@@ -363,7 +370,7 @@ async def test_high_throughput():
             return dataclasses.replace(state, value=new_value)
 
     # Set up system and actor
-    system = ActorSystem()
+    system = TestActorSystem()
     actor = system.spawn(CounterActor, CounterState())
 
     # Send a large number of messages
@@ -400,7 +407,7 @@ async def test_recursive_actor_step_execution():
             return dataclasses.replace(state, events=new_events)
 
     # Set up system and actors
-    system = ActorSystem()
+    system = TestActorSystem()
 
     # Create two actors - second one first so it can be referenced
     actor2 = system.spawn(ForwardingActor, ForwardingState())
@@ -453,7 +460,7 @@ async def test_request_with_broken_response():
             return dataclasses.replace(state, error=new_error)
 
     # Set up actors
-    system = ActorSystem()
+    system = TestActorSystem()
     responder = system.spawn(BrokenResponderActor, BrokenResponderState())
     requester = system.spawn(RequesterActor, RequesterState(), responder)
 
@@ -480,7 +487,7 @@ async def test_actor_step_exception_handling():
                 raise ValueError("Negative values not allowed")
             return dataclasses.replace(state, value=state.value + sum(events))
 
-    system = ActorSystem()
+    system = TestActorSystem()
     actor = system.spawn(FailingActor, FailingActorState())
 
     # Send valid messages
@@ -539,7 +546,7 @@ async def test_stash_unstash_happy_path_preserves_order_and_empties_stash():
                 stashed_count=new_stashed_count,
             )
 
-    system = ActorSystem()
+    system = TestActorSystem()
     actor = system.spawn(StashingActor, S())
 
     actor.tell("pause")
@@ -600,7 +607,7 @@ async def test_multiple_batches_stashed_then_single_resume_replays_all_in_order(
                 stashed_count=new_stashed_count,
             )
 
-    system = ActorSystem()
+    system = TestActorSystem()
     actor = system.spawn(StashingActor, S())
 
     actor.tell("pause")

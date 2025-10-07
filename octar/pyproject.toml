@@ -36,6 +36,11 @@ dependencies = ["python-generics>=0.2.3", "lazy-object-proxy>=1.11.0"]
 Repository = "https://github.com/sf-300/octar"
 Issues = "https://github.com/sf-300/octar/issues"
 
+[project.optional-dependencies]
+temporal = [
+    "temporalio>=1.18.0",
+]
+
 [tool.hatch.version]
 path = "src/octar/__init__.py"
 
@@ -124,6 +129,7 @@ config-settings = { editable_mode = "compat" }
 
 [dependency-groups]
 dev = [
+    "mypy>=1.18.2",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",
     "pytest-cov>=6.2.1",

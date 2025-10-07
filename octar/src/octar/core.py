@@ -1,7 +1,7 @@
 import asyncio as aio
 import typing as t
 from dataclasses import dataclass
-from logging import Logger
+from logging import Logger, LoggerAdapter
 
 from .base import ActorId, ActorMessage
 
@@ -29,7 +29,7 @@ class Send(t.Protocol):
 
 @dataclass(frozen=True, slots=True)
 class InternalActorSystem:
-    logger: Logger
+    logger: Logger | LoggerAdapter
     send: Send
     spawn: Spawn
     on_message_processed: t.Callable[[ActorId, ActorMessage], None]

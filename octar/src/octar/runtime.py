@@ -4,16 +4,17 @@ import dataclasses
 import functools
 import inspect
 import itertools
-import logging
 import typing as t
+from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from logging import Logger, LoggerAdapter
 from warnings import deprecated
 
 from generics import get_filled_type
 from lazy_object_proxy import Proxy
 
-from .base import (
+from octar.base import (
     ActorId,
     ActorLike,
     ActorMessage,
@@ -22,15 +23,17 @@ from .base import (
     MsgPriority,
     Request,
 )
-from .core import InternalActorSystem, InternalReceiver, Registrator
-from .environment import Environment, guess_env
-from .stash import LiveStash
-from .utils import create_resolved_f, running
+from octar.core import InternalActorSystem, InternalReceiver, Registrator
+from octar.environment import Environment
+from octar.stash import LiveStash
+from octar.utils import create_resolved_f, running
 
 
 @dataclass(frozen=True, kw_only=True)
 class ActorState[M]:
-    _actor_id: ActorId | None = field(default_factory=lambda: ActorSystem._current_actor_id.get())
+    _actor_id: ActorId | None = field(
+        default_factory=lambda: BaseActorSystem._current_actor_id.get()
+    )
     _actor_stash: tuple[M, ...] = ()
 
     @property
@@ -52,7 +55,7 @@ class ActorState[M]:
 
 
 class _ActorRefDecl[M](ActorLike[M]):
-    def __init__(self, actor_id: ActorId, actor_system: "ActorSystem") -> None: ...
+    def __init__(self, actor_id: ActorId, actor_system: "BaseActorSystem") -> None: ...
     def tell(self, *msgs) -> t.Any: ...
     def ask(self, msg) -> t.Any: ...
     @property
@@ -60,7 +63,7 @@ class _ActorRefDecl[M](ActorLike[M]):
 
 
 class _ActorRefImpl(Proxy):
-    def __init__(self, actor_id: ActorId, actor_system: "ActorSystem") -> None:
+    def __init__(self, actor_id: ActorId, actor_system: "BaseActorSystem") -> None:
         super().__init__(lambda: actor_system[actor_id])
 
     # @classmethod
@@ -139,7 +142,7 @@ class Actor[S: ActorState, M: ActorMessage](Sender[M]):
     ) -> None:
         # HACK: As we're setting `_actor_id` of the State by default from the contextvar, a new Actor will get the
         #       state with `_actor_id` set to the actor that is spawning it. We need to override it here.
-        if ActorSystem._current_actor_id.get() != state.actor_id:
+        if BaseActorSystem._current_actor_id.get() != state.actor_id:
             actor_id = state.actor_id if state.actor_id is not None else actor_id
         actor_id = actor_id if actor_id is not None else registrator.create_actor_id()
         state = dataclasses.replace(state, _actor_id=actor_id)
@@ -184,7 +187,7 @@ class Actor[S: ActorState, M: ActorMessage](Sender[M]):
         return self.__stash
 
     @property
-    def _logger(self) -> logging.Logger:
+    def _logger(self) -> Logger | LoggerAdapter:
         return self.__actor_system.logger
 
     def _spawn[**P, R: Actor](
@@ -291,7 +294,7 @@ class ExternalSender[M: ActorMessage](Sender[M]):
 
 
 # MARK: ActorSystem
-class ActorSystem:
+class BaseActorSystem[S, M: ActorMessage](ABC):
     # _current_system: ContextVar["ActorSystem | None"] = ContextVar("current_system", default=None)
     _current_actor_id: ContextVar[ActorId | None] = ContextVar("current_actor", default=None)
     _max_batch_msgs: int = 42
@@ -300,13 +303,18 @@ class ActorSystem:
     # def current_system(cls) -> "ActorSystem | None":
     #     return cls._current_system.get()
 
-    def __init__(self, environment: Environment | None = None, logger=None) -> None:
+    def __init__(self, environment: Environment, logger: Logger | LoggerAdapter) -> None:
         self.__scheduled = aio.Queue[Scheduled]()
-        self.__logger = logging.getLogger(__name__) if logger is None else logger
-        self.__environment = environment or guess_env()
+        self.__logger = logger
+        self.__environment = environment
         self.__receivers = dict[ActorId, InternalReceiver | ExternalReceiver]()
         self.__pendings_ops = set[aio.Future]()
         self.__running = False
+
+    @property
+    @abstractmethod
+    def state(self) -> S:
+        pass
 
     def __getitem__(self, actor_id: ActorId) -> Actor:
         receiver = self.__receivers[actor_id]
@@ -332,19 +340,21 @@ class ActorSystem:
     def is_running(self) -> bool:
         return self.__running
 
-    def _on_message_enqueued(self, actor_id: ActorId, msg: ActorMessage) -> None:
+    def _on_message_enqueued(self, actor_id: ActorId, msg: ActorMessage) -> None:  # noqa: B027
         pass
 
-    def _on_message_processed(self, actor_id: ActorId, msg: ActorMessage) -> None:
+    def _on_message_processed(self, actor_id: ActorId, msg: ActorMessage) -> None:  # noqa: B027
         pass
 
-    def _on_actor_state_changed(self, actor_id: ActorId, old: ActorState, new: ActorState) -> None:
+    def _on_actor_state_changed(  # noqa: B027
+        self, actor_id: ActorId, old: ActorState, new: ActorState
+    ) -> None:
         pass
 
-    def _on_receiver_registered(self, actor_id: ActorId) -> None:
+    def _on_receiver_registered(self, actor_id: ActorId) -> None:  # noqa: B027
         pass
 
-    def _on_receiver_unregistered(self, actor_id: ActorId) -> None:
+    def _on_receiver_unregistered(self, actor_id: ActorId) -> None:  # noqa: B027
         pass
 
     @functools.cached_property
@@ -358,7 +368,7 @@ class ActorSystem:
             _get_current_actor_id=self._current_actor_id.get,
         )
 
-    def register_external[M: ActorMessage](
+    def register_external(
         self, receiver: ExternalReceiver[M], actor_id: ActorId | None = None
     ) -> ExternalSender[M]:
         actor_id = actor_id if actor_id is not None else self.__environment.create_actor_id()
@@ -452,7 +462,10 @@ class ActorSystem:
 
             return f
 
-    async def step(self) -> None:
+    async def step(self, *msgs: M) -> None:
+        # NOTE: It's expected that inheritors will override this method and inject messages
+        #       into approprate actors by calling super.step(...).
+        del msgs
         if self.__running:
             raise RuntimeError("Actor system is already running")
         self.__running = True
