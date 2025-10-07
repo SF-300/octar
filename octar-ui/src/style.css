@@ -1,0 +1,40 @@
+/* Demo styles for actor system visualization */
+body {
+  margin: 0;
+  padding: 20px;
+  font-family: Arial, sans-serif;
+  background: #f5f5f5;
+}
+
+#container {
+  width: 100%;
+  height: 600px;
+  border: 1px solid #ddd;
+  background: white;
+  position: relative;
+}
+
+.node-container {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 2px; /* Account for border */
+}
+
+.node-widget {
+  width: 100%;
+  height: 100%;
+  background: white;
+  border: 2px solid #4CAF50;
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+  box-sizing: border-box;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.node-widget:hover {
+  border-color: #2196F3;
+  box-shadow: 0 6px 12px rgba(0,0,0,0.25);
+  transform: translateY(-1px);
+}

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OctarUI Library Test</title>
+    
+    <!-- Webix CSS -->
+    <link rel="stylesheet" type="text/css" href="https://cdn.webix.com/edge/webix.css">
+    
+    <!-- Our built CSS -->
+    <link rel="stylesheet" href="./dist/octar-ui.css">
+</head>
+<body>
+    <h1>OctarUI Library Test</h1>
+    <p>Testing the built TypeScript library with modular structure.</p>
+    
+    <div id="container"></div>
+    
+    <!-- External dependencies -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.webix.com/edge/webix.js"></script>
+    
+    <!-- Our built library -->
+    <script src="./dist/octar-ui.umd.js"></script>
+    
+    <script>
+        // Test our library
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log('Libraries loaded, OctarUI available:', !!window.OctarUI);
+            
+            if (window.OctarUI) {
+                const container = document.getElementById('container');
+                const result = window.OctarUI.createVisualization(container);
+                console.log('Visualization created:', result);
+            } else {
+                console.error('OctarUI not found on window object');
+            }
+        });
+    </script>
+</body>
+</html>

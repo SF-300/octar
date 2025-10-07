@@ -1,0 +1,29 @@
+{
+  "name": "octar-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@types/d3": "^7.4.3",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7",
+    "vite-plugin-external-globals": "^0.4.1",
+    "webix": "^11.2.0"
+  },
+  "peerDependencies": {
+    "d3": "^7.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/octar-ui.umd.js",
+  "exports": {
+    ".": "./dist/octar-ui.umd.js",
+    "./style.css": "./dist/style.css"
+  }
+}

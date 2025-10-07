@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Octar UI - Development</title>
+    
+    <!-- External Dependencies -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.webix.com/edge/webix.js"></script>
+    <link rel="stylesheet" type="text/css" href="https://cdn.webix.com/edge/webix.css">
+    
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #f5f5f5;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        
+        #visualization {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <h1>Octar UI - Development Server</h1>
+    <div id="visualization"></div>
+    
+    <script type="module" src="/src/main.ts"></script>
+    <script type="module">
+        import { createVisualization } from '/src/main.ts';
+        
+        // Wait for DOM to be ready
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log('Libraries loaded, creating visualization...');
+            
+            const container = document.getElementById('visualization');
+            if (container) {
+                const result = createVisualization(container);
+                console.log('Visualization created:', result);
+            } else {
+                console.error('Visualization container not found');
+            }
+        });
+    </script>
+</body>
+</html>
