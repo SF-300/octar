@@ -3,42 +3,54 @@ import typing as t
 from dataclasses import dataclass
 from logging import Logger, LoggerAdapter
 
-from .base import ActorId, ActorMessage
+from .base import ActorId, ActorMessage, Request
 
 if t.TYPE_CHECKING:
     from .runtime import Actor, ActorState
 
 
 class Spawn(t.Protocol):
-    def __call__[**P, R: "Actor"](
+    def __call__[**P, S: "ActorState", R: "Actor"](
         self,
-        create_actor: t.Callable[t.Concatenate["Registrator", P], R],
+        create_actor: t.Callable[t.Concatenate["Registrator", S, P], R],
+        state: S,
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> R: ...
 
 
-class Send(t.Protocol):
+class Tell(t.Protocol):
     def __call__(
         self,
-        sender_id: ActorId | None,
         receiver_id: ActorId,
         *msgs: ActorMessage,
-    ) -> t.Awaitable[t.Any] | None: ...
+    ) -> None: ...
+
+
+class Ask(t.Protocol):
+    @t.overload
+    def __call__[Response: ActorMessage](
+        self,
+        receiver_id: ActorId,
+        msg: Request[Response],
+    ) -> t.Awaitable[Response]: ...
+
+    @t.overload
+    def __call__(
+        self,
+        receiver_id: ActorId,
+        msg: ActorMessage,
+    ) -> t.Awaitable[t.Any]: ...
 
 
 @dataclass(frozen=True, slots=True)
 class InternalActorSystem:
     logger: Logger | LoggerAdapter
-    send: Send
+    ask: Ask
+    tell: Tell
     spawn: Spawn
     on_message_processed: t.Callable[[ActorId, ActorMessage], None]
     on_actor_state_changed: t.Callable[[ActorId, "ActorState", "ActorState"], None]
-    _get_current_actor_id: t.Callable[[], ActorId | None]
-
-    @property
-    def current_actor_id(self) -> ActorId | None:
-        return self._get_current_actor_id()
 
 
 class Receive(t.Protocol):

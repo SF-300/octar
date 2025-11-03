@@ -1,6 +1,6 @@
 import typing as t
 
-from octar.base import ActorMessage, Envelope, Mailbox, MsgPriority
+from octar.base import ActorMessage, Envelope, Mailbox, MsgUrgency
 
 
 class LiveStash[M: ActorMessage](t.MutableSequence[M]):
@@ -48,7 +48,7 @@ class LiveStash[M: ActorMessage](t.MutableSequence[M]):
             raise RuntimeError("Cannot modify LiveStash while actor is not processing")
         while self._buffer:
             msg = self._buffer.pop(0)
-            self._mailbox.put_nowait(Envelope(MsgPriority.HIGH, next(self._msg_idx_iter), msg))
+            self._mailbox.put_nowait(Envelope(MsgUrgency.HIGH, next(self._msg_idx_iter), msg))
 
     def __call__(self, msg: M) -> None:
         self.append(msg)

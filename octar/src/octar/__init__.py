@@ -6,9 +6,7 @@ from octar.environment import DefaultEnv, Environment
 from octar.runtime import (
     Actor,
     ActorId,
-    ActorLike,
     ActorMessage,
-    ActorRef,
     ActorState,
     BaseActorSystem,
 )
@@ -16,10 +14,8 @@ from octar.runtime import (
 __all__ = [
     "Actor",
     "ActorId",
-    "ActorLike",
     "ActorState",
     "ActorMessage",
-    "ActorRef",
     "ActorSystem",
     "Registrator",
 ]

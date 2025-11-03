@@ -2,7 +2,7 @@ import typing as t
 from abc import ABC, abstractmethod
 from uuid import UUID
 
-from octar.base import ActorId
+from octar.base import ActorId, MessageId
 
 
 class Environment(ABC):
@@ -12,6 +12,9 @@ class Environment(ABC):
 
     def create_actor_id(self) -> ActorId:
         return t.cast(ActorId, self._uuid4().hex)
+
+    def create_message_id(self) -> MessageId:
+        return t.cast(MessageId, self._uuid4().hex)
 
 
 class DefaultEnv(Environment):

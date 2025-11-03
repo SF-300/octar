@@ -1,17 +1,24 @@
 import asyncio as aio
+import dataclasses
 import pickle
 import typing as t
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 from temporalio import workflow as wf
+from temporalio.common import VersioningBehavior
 from temporalio.exceptions import ApplicationError, ChildWorkflowError
 from temporalio.workflow import NondeterminismError
 
 from octar import ActorSystem
-from octar.core import ActorMessage
+from octar.base import ActorId
+from octar.core import ActorMessage, Request
+from octar.environment import Environment
+from octar.runtime import ActorState
+from octar.temporal.core import TemporalWorkflowEnv
 
 from .utils import BackoffParams, exponential_delays
 
@@ -125,6 +132,7 @@ def _is_unpickling_error(e: ChildWorkflowError) -> bool:
 #     worker = Worker(workflows=[MyWorkflowSignals, MyDriver])
 
 
+@warnings.deprecated("Too complex; use ActorSystemHostWorkflowV1 directly")
 @dataclass(frozen=True)
 class CoordinatorParamsV1[AP]:
     ac_params: AP
@@ -136,12 +144,14 @@ class CoordinatorParamsV1[AP]:
     )
 
 
+@warnings.deprecated("Too complex; use ActorSystemHostWorkflowV1 directly")
 @dataclass(frozen=True)
 class DriverParamsV1[AP]:
     event: bytes
     ac_params: AP
 
 
+@warnings.deprecated("Too complex; use ActorSystemHostWorkflowV1 directly")
 class BaseCoordinator[AP, M: ActorMessage]:
     def __init__(self, params: CoordinatorParamsV1[AP]) -> None:
         self._events = aio.Queue[M]()
@@ -152,6 +162,7 @@ class BaseCoordinator[AP, M: ActorMessage]:
         pass
 
 
+@warnings.deprecated("Too complex; use ActorSystemHostWorkflowV1 directly")
 class BaseDriver[AP, S, M: ActorMessage](ABC):
     @abstractmethod
     async def _create_actor_system(self, params: AP) -> ActorSystem[S, M]:
@@ -211,6 +222,10 @@ if t.TYPE_CHECKING:
         ) -> type[T] | t.Callable[[type[T]], type[T]]: ...
 
 
+_versioning_key = "versioning_behavior"
+
+
+@warnings.deprecated("Too complex; use ActorSystemHostWorkflowV1 directly")
 @contextmanager
 def workflow_defn_v1[AP, M: ActorMessage](
     ac_params_type: type[AP],
@@ -306,7 +321,20 @@ def workflow_defn_v1[AP, M: ActorMessage](
                     # FIXME: Also re-expose updates and queries?
                     yield (name, wf.signal(attr))  # type: ignore
 
-            coordinator_cls = wf.defn(**defn_kwargs)(
+                # NOTE: Coordinator is a long-lived workflow that must survive code changes,
+                #       so we set it to auto-upgrade mode.
+
+            _versioning_value = VersioningBehavior.AUTO_UPGRADE
+            if _versioning_key in defn_kwargs and defn_kwargs[_versioning_key] != _versioning_value:
+                warnings.warn("'versioning_behavior' is manually overridden - might cause issues")  # noqa: B028
+                _versioning_value = defn_kwargs.pop(_versioning_key)
+
+            coordinator_cls = wf.defn(
+                **{
+                    _versioning_key: _versioning_value,
+                    **defn_kwargs,
+                }
+            )(
                 patch_metadata(
                     type(
                         cls.__name__,
@@ -352,6 +380,14 @@ def workflow_defn_v1[AP, M: ActorMessage](
                 await actor_system.step(event)
                 await self._save_state(actor_system.state)
 
+            # NOTE: Drivers are controlled by coordinators, so when update is needed, drivers must be able to
+            #       finish doing what they were doing using the old code, then die gracefully, for the
+            #       coordinator to spawn new drivers with the new code.
+            _versioning_value = VersioningBehavior.PINNED
+            if _versioning_key in defn_kwargs and defn_kwargs[_versioning_key] != _versioning_value:
+                warnings.warn("'versioning_behavior' is manually overridden - might cause issues")  # noqa: B028
+                _versioning_value = defn_kwargs.pop(_versioning_key)
+
             driver_host_cls = wf.defn(
                 **{
                     "failure_exception_types": [
@@ -359,8 +395,9 @@ def workflow_defn_v1[AP, M: ActorMessage](
                         _UnpicklingFailed,
                         *defn_kwargs.pop("failure_exception_types", []),
                     ],
+                    _versioning_key: _versioning_value,
                     **defn_kwargs,
-                }
+                },
             )(
                 patch_metadata(
                     type(
@@ -389,3 +426,113 @@ def workflow_defn_v1[AP, M: ActorMessage](
 
     if coordinator_cls is None or driver_host_cls is None:
         raise ValueError("Both coordinator and driver decorators must be called exactly once")
+
+
+@dataclass(frozen=True)
+class Params:
+    pass
+
+
+class _ActorSystemInput(t.NamedTuple):
+    receiver: ActorId
+    msg: ActorMessage
+    response_fut: aio.Future | None
+
+
+class ActorSystemHostWorkflowV1[S: ActorState, M: ActorMessage](ABC):
+    def __init_subclass__(cls) -> None:
+        # NOTE: Temporal requires @workflow.init and @workflow.run to be applied to methods defined directly
+        # on the workflow class, not inherited. We need to patch metadata and assign to subclass.
+
+        def patch_metadata(obj, name: str):
+            obj.__module__ = cls.__module__
+            obj.__qualname__ = f"{cls.__qualname__}.{name}"
+            obj.__name__ = name
+            return obj
+
+        if "__init__" not in cls.__dict__:
+
+            def init_proxy(self, params: Params) -> None:
+                ActorSystemHostWorkflowV1.__init__(self, params)
+
+            cls.__init__ = wf.init(patch_metadata(init_proxy, "__init__"))
+
+        if "__call__" not in cls.__dict__:
+
+            async def call_proxy(self, params: Params) -> None:
+                await ActorSystemHostWorkflowV1.__call__(self, params)
+
+            cls.__call__ = wf.run(patch_metadata(call_proxy, "__call__"))
+
+    def __init__(self, params: Params) -> None:
+        self.__params = params
+        self.__env = TemporalWorkflowEnv(wf)
+        self.__input = aio.Queue[_ActorSystemInput]()
+
+    @abstractmethod
+    async def _create_actor_system(self, env: Environment, params: Params) -> ActorSystem[S, M]:
+        pass
+
+    @abstractmethod
+    async def _save_state(self, state: S) -> None:
+        pass
+
+    def _tell(self, receiver_id: ActorId, msg: M) -> None:
+        self.__input.put_nowait(_ActorSystemInput(receiver_id, msg, None))
+
+    def _ask[Response: ActorMessage](
+        self, receiver_id: ActorId, msg: Request[Response]
+    ) -> t.Awaitable[Response]:
+        if not isinstance(msg, Request):
+            raise TypeError("Message passed to 'ask' must be a Request")
+        # NOTE: Those complications with futures being created here rather than using the actor system's
+        #       ask machinery directly is because the Actor System is created asynchronously and might not exist when
+        #       a request comes.
+        f = aio.Future()
+        self.__input.put_nowait(_ActorSystemInput(receiver_id, msg, f))
+        return f
+
+    async def _run_until_continue_as_new_suggested(self) -> None:
+        actor_system = await self._create_actor_system(self.__env, self.__params)
+
+        async def step(
+            receiver_id: ActorId, msg: ActorMessage, response_fut: aio.Future | None
+        ) -> None:
+            async with actor_system:
+                if response_fut is not None:
+                    asker_id = msg._actor_asker_id
+                    if asker_id is None:
+                        asker_id = self.__env.create_actor_id()
+                        msg = dataclasses.replace(msg, _actor_asker_id=asker_id)
+                    actor_system.register_external(response_fut.set_result, asker_id, once=True)
+                # NOTE: We exploit the fact that for actor system internals it doesn't matter through which interface we
+                # are supplying requests - tell or ask - as long as the message has `Request` marker/mixin and
+                # _asker_id is properly set, the target actor should see it as a proper response and `_answer`
+                # accordingly. By using `tell` here we can spare the actor system the unnecessary future management and
+                # receiver re-wrapping overhead.
+                actor_system.tell(receiver_id, msg)
+            await self._save_state(actor_system.state)
+
+        cancellation = None
+        while not wf.info().is_continue_as_new_suggested():
+            step_task = aio.create_task(step(*(await self.__input.get())))
+            try:
+                await aio.shield(step_task)
+            except aio.CancelledError as e:
+                cancellation = e
+                await step_task
+                break
+
+        # Draining the input queue to ensure all messages sent before continue-as-new suggestion are processed.
+        while not self.__input.empty():
+            await step(*(await self.__input.get()))
+
+        if cancellation is not None:
+            raise cancellation
+
+    async def _continue_as_new(self, params: Params) -> None:
+        wf.continue_as_new(params)
+
+    async def __call__(self, params: Params) -> None:
+        await self._run_until_continue_as_new_suggested()
+        await self._continue_as_new(params)
